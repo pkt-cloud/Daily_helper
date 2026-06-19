@@ -198,10 +198,10 @@ Delete old default certificate binding:
 ```powershell
 netsh http delete sslcert ipport=0.0.0.0:443
 ```
-Delete old/malformed prod-agent bindings if present:
+Delete old/malformed env-agent bindings if present:
 ```powershell
-netsh http delete sslcert hostnameport=prod-agent-vm-2.example.com:443
-netsh http delete sslcert hostnameport=prod-agent-vm-2.example.comprod-agent-vm-2.example.com:443
+netsh http delete sslcert hostnameport=env-agent-vm.example.com:443
+netsh http delete sslcert hostnameport=env-agent-vm.example.comenv-agent-vm.example.com:443
 ```
 If any command says:
 ```text
