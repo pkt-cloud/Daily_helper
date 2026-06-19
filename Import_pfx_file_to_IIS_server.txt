@@ -1,0 +1,92 @@
+=======================================
+Put the PFX in a folder like:
+=======================================
+C:\Temp\Certs\newdev.example.com.pfx
+
+=======================================
+Then import:
+=======================================
+$PfxPath = "C:\Temp\Certs\newdev.example.com.pfx"
+$PfxPassword = Read-Host "Enter PFX password" -AsSecureString
+
+$cert = Import-PfxCertificate `
+  -FilePath $PfxPath `
+  -CertStoreLocation "Cert:\LocalMachine\My" `
+  -Password $PfxPassword
+
+$cert | Format-List Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, DnsNameList, EnhancedKeyUsageList
+
+Expected:
+HasPrivateKey : True
+DnsNameList   : newdev.example.com
+
+=======================================
+Confirm imported cert is correct
+=======================================
+$cert | Format-List Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, DnsNameList, EnhancedKeyUsageList
+
+Expected:
+Subject/DnsNameList : newdev.example.com
+HasPrivateKey       : True
+EnhancedKeyUsage    : Server Authentication
+
+=======================================
+Set thumbprint:
+=======================================
+
+$Thumbprint = ($cert.Thumbprint -replace "\s","").ToUpper()
+$Thumbprint
+
+==============================================================================
+If you opened a new PowerShell session, find it again:
+==============================================================================
+
+$HostName = "newdev.example.com"
+
+$cert = Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Subject -like "*$HostName*" -or
+    ($_.DnsNameList | ForEach-Object { $_.Unicode }) -contains $HostName
+} |
+Where-Object { $_.HasPrivateKey -eq $true } |
+Sort-Object NotBefore -Descending |
+Select-Object -example 1
+
+$cert | Format-List Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, DnsNameList
+
+$Thumbprint = ($cert.Thumbprint -replace "\s","").ToUpper()
+
+==============================================================================
+Backup existing bindings
+==============================================================================
+netsh http show sslcert > C:\Temp\sslcert-before-new-cert-bind.txt
+
+Get-WebBinding -Name "example-DEV" |
+Select-Object protocol, bindingInformation, sslFlags |
+Out-File C:\Temp\iis-bindings-before-new-cert-bind.txt
+
+==============================================================================
+Ensure IIS web binding exists for newdev
+==============================================================================
+Import-Module WebAdministration
+
+$SiteName = "example-DEV"
+$HostName = "newdev.example.com"
+
+$binding = Get-WebBinding -Name $SiteName -Protocol "https" |
+Where-Object { $_.bindingInformation -eq "*:443:$HostName" }
+
+if (-not $binding) {
+    New-WebBinding -Name $SiteName -Protocol https -Port 443 -HostHeader $HostName -SslFlags 1
+}
+else {
+    Write-Host "HTTPS binding already exists for $HostName"
+}
+
+Confirm:
+Get-WebBinding -Name "example-DEV" -Protocol "https" |
+Select-Object protocol, bindingInformation, sslFlags
+
+Expected:
+https    *:443:newdev.example.com    1
+
