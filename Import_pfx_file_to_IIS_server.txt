@@ -1,4 +1,62 @@
 =======================================
+verify the cert
+=======================================
+Set values
+
+$CerPath  = "C:\Temp\Certs\newdev.example.com.cer"
+$HostName = "newdev.example.com"
+
+=======================================
+Read .cer details
+=======================================
+$cer = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CerPath)
+
+$cer | Format-List Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, DnsNameList, EnhancedKeyUsageList
+
+=======================================
+Backup first
+=======================================
+
+netsh http show sslcert > C:\Temp\sslcert-before-cleanup.txt
+
+Get-WebBinding |
+Select-Object protocol, bindingInformation, sslFlags |
+Out-File C:\Temp\iis-bindings-before-cleanup.txt
+
+=======================================
+Confirm new certificate is available
+=======================================
+
+$HostName = "newdev.example.com"
+
+$cert = Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Subject -like "*$HostName*" -or
+    ($_.DnsNameList | ForEach-Object { $_.Unicode }) -contains $HostName
+} |
+Where-Object { $_.HasPrivateKey -eq $true } |
+Sort-Object NotBefore -Descending |
+Select-Object -First 1
+
+$cert | Format-List Subject, Issuer, Thumbprint, NotAfter, HasPrivateKey, DnsNameList
+
+$Thumbprint = ($cert.Thumbprint -replace "\s","").ToUpper()
+
+Proceed only if:
+
+HasPrivateKey : True
+DnsNameList   : newdev.example.com
+
+=======================================
+Clean only old/wrong bindings
+=======================================
+
+Do not delete 44300, 44301, 44302, etc.
+
+netsh http delete sslcert ipport=0.0.0.0:443
+
+
+=======================================
 Put the PFX in a folder like:
 =======================================
 C:\Temp\Certs\newdev.example.com.pfx
@@ -64,6 +122,17 @@ netsh http show sslcert > C:\Temp\sslcert-before-new-cert-bind.txt
 Get-WebBinding -Name "example-DEV" |
 Select-Object protocol, bindingInformation, sslFlags |
 Out-File C:\Temp\iis-bindings-before-new-cert-bind.txt
+
+=======================================
+Backup first
+=======================================
+
+netsh http show sslcert > C:\Temp\sslcert-before-cleanup.txt
+
+Get-WebBinding |
+Select-Object protocol, bindingInformation, sslFlags |
+Out-File C:\Temp\iis-bindings-before-cleanup.txt
+
 
 ==============================================================================
 Ensure IIS web binding exists for newdev
