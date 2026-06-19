@@ -4,7 +4,7 @@ IIS Certificate Replacement Runbook for `newdev.example.com`
 Purpose
 This runbook explains how to import and verify a corrected `.pfx` certificate on the IIS VM, replace the wrong certificate binding, and validate the final HTTPS configuration.
 
-This is based on the current situation:
+This is based on the situation:
 IIS hostname is already correct: `newdev.example.com`
 Problem is not the IIS hostname binding
 Problem is the certificate hostname mismatch
