@@ -1,0 +1,195 @@
+cat > /c/Temp/gitbash_tls_diagnose.sh <<'EOF'
+#!/usr/bin/env bash
+
+# ============================================================
+# Sanitized Git Bash TLS Certificate Diagnostic
+# Does not print exact subject/issuer names.
+# ============================================================
+
+HOST="newdev.example.com"
+PORT="443"
+PFX="/c/Temp/Certs/newdev.first.com.pfx"
+OUT="/c/Temp/gitbash_tls_diagnosis.txt"
+
+echo "============================================================" > "$OUT"
+echo "SANITIZED GIT BASH TLS CERTIFICATE DIAGNOSTIC" >> "$OUT"
+echo "Generated: $(date)" >> "$OUT"
+echo "Sensitive subject/issuer names are intentionally hidden." >> "$OUT"
+echo "============================================================" >> "$OUT"
+echo "" >> "$OUT"
+
+check_text() {
+  local TEXT="$1"
+  local PATTERN="$2"
+  local PASS_MSG="$3"
+  local FAIL_MSG="$4"
+
+  echo "$TEXT" | grep -Eiq "$PATTERN"
+  if [ $? -eq 0 ]; then
+    echo "[PASS] $PASS_MSG" >> "$OUT"
+  else
+    echo "[FAIL] $FAIL_MSG" >> "$OUT"
+  fi
+}
+
+check_warn_text() {
+  local TEXT="$1"
+  local PATTERN="$2"
+  local PASS_MSG="$3"
+  local WARN_MSG="$4"
+
+  echo "$TEXT" | grep -Eiq "$PATTERN"
+  if [ $? -eq 0 ]; then
+    echo "[PASS] $PASS_MSG" >> "$OUT"
+  else
+    echo "[WARN] $WARN_MSG" >> "$OUT"
+  fi
+}
+
+analyze_cert_text() {
+  local LABEL="$1"
+  local TEXT="$2"
+
+  echo "" >> "$OUT"
+  echo "------------------------------------------------------------" >> "$OUT"
+  echo "$LABEL" >> "$OUT"
+  echo "------------------------------------------------------------" >> "$OUT"
+
+  if echo "$TEXT" | grep -qi "unable to load certificate"; then
+    echo "[FAIL] Unable to load certificate." >> "$OUT"
+    return
+  fi
+
+  if echo "$TEXT" | grep -qi "No extensions in certificate"; then
+    echo "[FAIL] CERTIFICATE_HAS_NO_EXTENSIONS" >> "$OUT"
+  else
+    check_text "$TEXT" "X509v3 extensions" \
+      "Certificate has X.509 extensions." \
+      "Certificate extensions block not found."
+  fi
+
+  check_text "$TEXT" "Subject Alternative Name" \
+    "SAN extension exists." \
+    "SAN_EXTENSION_MISSING"
+
+  check_text "$TEXT" "DNS:${HOST}" \
+    "Expected hostname is present in SAN." \
+    "EXPECTED_HOST_NOT_FOUND_IN_SAN"
+
+  check_text "$TEXT" "Extended Key Usage" \
+    "Enhanced Key Usage extension exists." \
+    "EKU_EXTENSION_MISSING"
+
+  check_text "$TEXT" "TLS Web Server Authentication|serverAuth|1.3.6.1.5.5.7.3.1" \
+    "Server Authentication EKU exists." \
+    "SERVER_AUTHENTICATION_EKU_MISSING"
+
+  check_warn_text "$TEXT" "Key Usage" \
+    "Key Usage extension exists." \
+    "KEY_USAGE_EXTENSION_MISSING"
+
+  check_warn_text "$TEXT" "Digital Signature" \
+    "Key Usage contains Digital Signature." \
+    "KEY_USAGE_DIGITAL_SIGNATURE_MISSING"
+
+  check_warn_text "$TEXT" "Key Encipherment" \
+    "Key Usage contains Key Encipherment." \
+    "KEY_USAGE_KEY_ENCIPHERMENT_MISSING"
+
+  check_warn_text "$TEXT" "Basic Constraints" \
+    "Basic Constraints extension exists." \
+    "BASIC_CONSTRAINTS_MISSING"
+
+  if echo "$TEXT" | grep -Eiq "CA:TRUE"; then
+    echo "[FAIL] CERTIFICATE_IS_CA_TRUE_DO_NOT_BIND_AS_IIS_SERVER_CERT" >> "$OUT"
+  elif echo "$TEXT" | grep -Eiq "CA:FALSE"; then
+    echo "[PASS] Basic Constraints shows CA:FALSE." >> "$OUT"
+  else
+    echo "[WARN] Basic Constraints CA flag not found." >> "$OUT"
+  fi
+
+  echo "" >> "$OUT"
+  echo "Validity lines:" >> "$OUT"
+  echo "$TEXT" | grep -Ei "Not Before|Not After" >> "$OUT"
+}
+
+echo "Checking remote IIS-served certificate..." >> "$OUT"
+
+REMOTE_TEXT=$(echo | openssl s_client \
+  -connect "${HOST}:${PORT}" \
+  -servername "${HOST}" \
+  -showcerts 2>/dev/null | openssl x509 -noout -text 2>&1)
+
+analyze_cert_text "REMOTE IIS-SERVED CERTIFICATE" "$REMOTE_TEXT"
+
+echo "" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+echo "OPENSSL VERIFY HOSTNAME CHECK" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+
+VERIFY_OUTPUT=$(echo | openssl s_client \
+  -connect "${HOST}:${PORT}" \
+  -servername "${HOST}" \
+  -verify_hostname "${HOST}" 2>&1)
+
+VERIFY_CODE=$(echo "$VERIFY_OUTPUT" | grep -i "Verify return code" | tail -1)
+
+if [ -n "$VERIFY_CODE" ]; then
+  echo "$VERIFY_CODE" >> "$OUT"
+else
+  echo "Verify return code not found." >> "$OUT"
+fi
+
+if echo "$VERIFY_OUTPUT" | grep -qi "hostname mismatch"; then
+  echo "[FAIL] OPENSSL_HOSTNAME_MISMATCH" >> "$OUT"
+fi
+
+if echo "$VERIFY_OUTPUT" | grep -qi "unable to verify the first certificate"; then
+  echo "[FAIL] OPENSSL_CHAIN_INCOMPLETE_OR_CA_NOT_TRUSTED" >> "$OUT"
+fi
+
+if echo "$VERIFY_OUTPUT" | grep -qi "Verify return code: 0"; then
+  echo "[PASS] OpenSSL verification succeeded." >> "$OUT"
+else
+  echo "[WARN] OpenSSL verification did not return code 0." >> "$OUT"
+fi
+
+echo "" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+echo "OPTIONAL PFX FILE CHECK" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+
+if [ -f "$PFX" ]; then
+  echo "PFX file found. You may be prompted for PFX password." >> "$OUT"
+
+  PFX_TEXT=$(openssl pkcs12 \
+    -in "$PFX" \
+    -nokeys \
+    -clcerts 2>/dev/null | openssl x509 -noout -text 2>&1)
+
+  analyze_cert_text "PFX LEAF CERTIFICATE" "$PFX_TEXT"
+else
+  echo "[WARN] PFX file not found at configured path." >> "$OUT"
+  echo "Configured PFX path: hidden in this script output." >> "$OUT"
+fi
+
+echo "" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+echo "COMMON INTERPRETATION" >> "$OUT"
+echo "------------------------------------------------------------" >> "$OUT"
+echo "CERTIFICATE_HAS_NO_EXTENSIONS => Reissue certificate using Web Server/TLS Server template." >> "$OUT"
+echo "SAN_EXTENSION_MISSING => Reissue with Subject Alternative Name." >> "$OUT"
+echo "EXPECTED_HOST_NOT_FOUND_IN_SAN => Certificate hostname does not match IIS/SAP URL." >> "$OUT"
+echo "SERVER_AUTHENTICATION_EKU_MISSING => Causes SEC_E_CERT_WRONG_USAGE." >> "$OUT"
+echo "OPENSSL_CHAIN_INCOMPLETE_OR_CA_NOT_TRUSTED => Provide/import Root/Intermediate CA chain." >> "$OUT"
+echo "CERTIFICATE_IS_CA_TRUE => Wrong cert was bound; do not bind CA/intermediate certificate to IIS." >> "$OUT"
+
+echo "" >> "$OUT"
+echo "Diagnostic completed." >> "$OUT"
+
+echo ""
+echo "Sanitized Git Bash TLS diagnostic completed."
+echo "Report created at:"
+echo "$OUT"
+echo ""
+EOF
