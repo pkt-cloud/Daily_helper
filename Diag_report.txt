@@ -1,5 +1,6 @@
 # ============================================================
 # IIS HTTPS Certificate Diagnostic Script - READ ONLY
+# Corrected version
 # Purpose:
 #   Diagnose IIS/HTTP.SYS certificate binding, hostname, EKU,
 #   SAN, chain, and served certificate issues.
@@ -42,7 +43,7 @@ function Get-NetshCertHash {
     $text = $output -join "`n"
 
     if ($text -match "Certificate Hash\s+:\s+([a-fA-F0-9]+)") {
-        return ($Matches[1] -replace "\s","").ToUpper()
+        return ($Matches[1] -replace "\s", "").ToUpper()
     }
     else {
         return $null
@@ -54,10 +55,14 @@ function Find-CertByThumbprint {
         [string]$Thumbprint
     )
 
-    $Thumbprint = ($Thumbprint -replace "\s","").ToUpper()
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+        return $null
+    }
+
+    $Thumbprint = ($Thumbprint -replace "\s", "").ToUpper()
 
     Get-ChildItem Cert:\LocalMachine -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { ($_.Thumbprint -replace "\s","").ToUpper() -eq $Thumbprint } |
+    Where-Object { ($_.Thumbprint -replace "\s", "").ToUpper() -eq $Thumbprint } |
     Select-Object -First 1
 }
 
@@ -119,11 +124,11 @@ function Test-CertificateForHttps {
     Format-Table -AutoSize
 
     # Subject Alternative Name check
-    $sanExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.17" }
+    $sanExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.17" } | Select-Object -First 1
 
     $dnsNames = @()
     try {
-        $dnsNames = $Cert.DnsNameList | ForEach-Object { $_.Unicode }
+        $dnsNames = @($Cert.DnsNameList | ForEach-Object { $_.Unicode })
     }
     catch {
         $dnsNames = @()
@@ -152,12 +157,12 @@ function Test-CertificateForHttps {
     }
 
     # Enhanced Key Usage check
-    $ekuExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.37" }
+    $ekuExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.37" } | Select-Object -First 1
 
     if ($ekuExt) {
         Write-Result "PASS" "Enhanced Key Usage extension exists."
 
-        $ekuOids = $Cert.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId }
+        $ekuOids = @($Cert.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId })
 
         if ($ekuOids -contains "1.3.6.1.5.5.7.3.1") {
             Write-Result "PASS" "Enhanced Key Usage contains Server Authentication."
@@ -171,24 +176,21 @@ function Test-CertificateForHttps {
     }
 
     # Key Usage check
-    $kuExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.15" }
+    $kuExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.15" } | Select-Object -First 1
 
     if ($kuExt) {
         try {
-            $ku = New-Object System.Security.Cryptography.X509Certificates.X509KeyUsageExtension($kuExt, $false)
-            Write-Host "Key Usage: $($ku.KeyUsages)"
+            $kuText = $kuExt.Format($true)
+            Write-Host "Key Usage: $kuText"
 
-            $hasDigitalSignature = [bool]($ku.KeyUsages -band [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature)
-            $hasKeyEncipherment  = [bool]($ku.KeyUsages -band [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyEncipherment)
-
-            if ($hasDigitalSignature) {
+            if ($kuText -match "Digital Signature") {
                 Write-Result "PASS" "Key Usage contains Digital Signature."
             }
             else {
                 Write-Result "WARN" "Key Usage does not contain Digital Signature."
             }
 
-            if ($hasKeyEncipherment) {
+            if ($kuText -match "Key Encipherment") {
                 Write-Result "PASS" "Key Usage contains Key Encipherment."
             }
             else {
@@ -196,7 +198,7 @@ function Test-CertificateForHttps {
             }
         }
         catch {
-            Write-Result "WARN" "Unable to parse Key Usage extension."
+            Write-Result "WARN" "Unable to parse Key Usage extension. $($_.Exception.Message)"
         }
     }
     else {
@@ -204,21 +206,22 @@ function Test-CertificateForHttps {
     }
 
     # Basic Constraints check
-    $bcExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.19" }
+    $bcExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.19" } | Select-Object -First 1
 
     if ($bcExt) {
         try {
-            $bc = New-Object System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension($bcExt, $false)
+            $bcText = $bcExt.Format($true)
+            Write-Host "Basic Constraints: $bcText"
 
-            if ($bc.CertificateAuthority) {
-                Write-Result "FAIL" "Certificate is marked as CA:TRUE. Do not bind CA/intermediate cert as IIS server certificate."
+            if ($bcText -match "CA\s*=\s*TRUE" -or $bcText -match "Subject Type\s*=\s*CA") {
+                Write-Result "FAIL" "Certificate appears to be CA:TRUE. Do not bind CA/intermediate cert as IIS server certificate."
             }
             else {
-                Write-Result "PASS" "Basic Constraints shows CA:FALSE."
+                Write-Result "PASS" "Basic Constraints does not indicate CA:TRUE."
             }
         }
         catch {
-            Write-Result "WARN" "Unable to parse Basic Constraints extension."
+            Write-Result "WARN" "Unable to parse Basic Constraints extension. $($_.Exception.Message)"
         }
     }
     else {
@@ -263,7 +266,7 @@ Write-Host "============================================================"
 Import-Module WebAdministration -ErrorAction SilentlyContinue
 
 $iisBinding = Get-WebBinding -Name $SiteName -Protocol "https" -ErrorAction SilentlyContinue |
-Where-Object { $_.bindingInformation -eq "*:$Port:$HostName" }
+Where-Object { $_.bindingInformation -eq "*:${Port}:${HostName}" }
 
 if ($iisBinding) {
     Write-Result "PASS" "IIS HTTPS binding exists for $HostName on port $Port."
@@ -299,11 +302,11 @@ $hostHash = Get-NetshCertHash $hostBindingArg
 $defaultHash = Get-NetshCertHash $defaultBindingArg
 
 if ($hostHash) {
-    Write-Result "PASS" "HTTP.SYS hostname binding exists for $HostName:$Port"
+    Write-Result "PASS" "HTTP.SYS hostname binding exists for $($HostName):$Port"
     Write-Host "Hostname binding cert hash: $hostHash"
 }
 else {
-    Write-Result "FAIL" "HTTP.SYS hostname binding is missing for $HostName:$Port"
+    Write-Result "FAIL" "HTTP.SYS hostname binding is missing for $($HostName):$Port"
 }
 
 if ($defaultHash) {
@@ -336,7 +339,7 @@ if ($hostHash) {
     $hostCert = Find-CertByThumbprint $hostHash
 
     if ($hostCert) {
-        Test-CertificateForHttps -Cert $hostCert -Label "HTTP.SYS Hostname Binding Certificate ($HostName:$Port)" -RequirePrivateKey $true
+        Test-CertificateForHttps -Cert $hostCert -Label "HTTP.SYS Hostname Binding Certificate ($($HostName):$Port)" -RequirePrivateKey $true
     }
     else {
         Write-Result "FAIL" "Could not find hostname binding certificate in LocalMachine certificate stores."
@@ -366,17 +369,15 @@ Write-Host "============================================================"
 try {
     $script:RemoteSslPolicyErrors = $null
 
-    $tcp = New-Object Net.Sockets.TcpClient($HostName, $Port)
+    $tcp = New-Object System.Net.Sockets.TcpClient($HostName, $Port)
 
-    $ssl = New-Object Net.Security.SslStream(
-        $tcp.GetStream(),
-        $false,
-        {
-            param($sender, $certificate, $chain, $sslPolicyErrors)
-            $script:RemoteSslPolicyErrors = $sslPolicyErrors
-            return $true
-        }
-    )
+    $callback = [System.Net.Security.RemoteCertificateValidationCallback]{
+        param($sender, $certificate, $chain, $sslPolicyErrors)
+        $script:RemoteSslPolicyErrors = $sslPolicyErrors
+        return $true
+    }
+
+    $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $callback)
 
     $ssl.AuthenticateAsClient($HostName)
 
@@ -391,7 +392,7 @@ try {
         Write-Result "FAIL" "Remote certificate validation has policy errors: $script:RemoteSslPolicyErrors"
     }
 
-    if ($hostHash -and (($remoteCert.Thumbprint -replace "\s","").ToUpper() -eq $hostHash)) {
+    if ($hostHash -and (($remoteCert.Thumbprint -replace "\s", "").ToUpper() -eq $hostHash)) {
         Write-Result "PASS" "Remote served certificate matches HTTP.SYS hostname binding certificate."
     }
     else {
