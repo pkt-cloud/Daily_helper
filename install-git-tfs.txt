@@ -1,0 +1,37 @@
+# Create tools folder
+New-Item -ItemType Directory -Force -Path "C:\Tools" | Out-Null
+
+# Download git-tfs release ZIP
+$GitTfsVersion = "0.34.0"
+$ZipUrl = "https://github.com/git-tfs/git-tfs/releases/download/v$GitTfsVersion/GitTfs-$GitTfsVersion.zip"
+$ZipPath = "C:\Tools\GitTfs-$GitTfsVersion.zip"
+$InstallPath = "C:\Tools\GitTfs"
+
+Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath
+
+# Remove old folder if exists
+if (Test-Path $InstallPath) {
+    Remove-Item $InstallPath -Recurse -Force
+}
+
+# Extract
+Expand-Archive -Path $ZipPath -DestinationPath $InstallPath -Force
+
+# Add git-tfs to system PATH
+$CurrentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+
+if ($CurrentPath -notlike "*$InstallPath*") {
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        "$CurrentPath;$InstallPath",
+        "Machine"
+    )
+}
+
+Write-Host "git-tfs installed to $InstallPath"
+Write-Host "Close and reopen PowerShell, then run: git tfs --version"
+
+
+Then verify:
+
+git tfs --version
