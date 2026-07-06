@@ -1,37 +1,53 @@
-# Create tools folder
-New-Item -ItemType Directory -Force -Path "C:\Tools" | Out-Null
+$ErrorActionPreference = "Stop"
 
-# Download git-tfs release ZIP
+# Version and paths
 $GitTfsVersion = "0.34.0"
-$ZipUrl = "https://github.com/git-tfs/git-tfs/releases/download/v$GitTfsVersion/GitTfs-$GitTfsVersion.zip"
-$ZipPath = "C:\Tools\GitTfs-$GitTfsVersion.zip"
-$InstallPath = "C:\Tools\GitTfs"
+$InstallRoot = "$env:LOCALAPPDATA\Programs\git-tfs"
+$ZipPath = "$env:TEMP\GitTfs-$GitTfsVersion.zip"
+$DownloadUrl = "https://github.com/git-tfs/git-tfs/releases/download/v$GitTfsVersion/GitTfs-$GitTfsVersion.zip"
 
-Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath
+# Force TLS 1.2 for older Windows/PowerShell environments
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Remove old folder if exists
-if (Test-Path $InstallPath) {
-    Remove-Item $InstallPath -Recurse -Force
+# Clean previous install
+if (Test-Path $InstallRoot) {
+    Remove-Item $InstallRoot -Recurse -Force
+}
+
+New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+
+# Download using curl.exe because it is more reliable than Invoke-WebRequest in many corporate networks
+curl.exe -L $DownloadUrl -o $ZipPath
+
+# Validate download
+if (!(Test-Path $ZipPath)) {
+    throw "Download failed. ZIP file was not created: $ZipPath"
 }
 
 # Extract
-Expand-Archive -Path $ZipPath -DestinationPath $InstallPath -Force
+Expand-Archive -Path $ZipPath -DestinationPath $InstallRoot -Force
 
-# Add git-tfs to system PATH
-$CurrentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+# Find git-tfs.exe even if ZIP extracted into nested folder
+$GitTfsExe = Get-ChildItem -Path $InstallRoot -Filter "git-tfs.exe" -Recurse | Select-Object -First 1
 
-if ($CurrentPath -notlike "*$InstallPath*") {
-    [Environment]::SetEnvironmentVariable(
-        "Path",
-        "$CurrentPath;$InstallPath",
-        "Machine"
-    )
+if (-not $GitTfsExe) {
+    throw "git-tfs.exe not found after extraction. Check ZIP extraction under: $InstallRoot"
 }
 
-Write-Host "git-tfs installed to $InstallPath"
-Write-Host "Close and reopen PowerShell, then run: git tfs --version"
+$GitTfsFolder = $GitTfsExe.Directory.FullName
 
+# Add to current PowerShell session PATH
+$env:Path = "$GitTfsFolder;$env:Path"
 
-Then verify:
+# Add to user PATH permanently
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($UserPath -notlike "*$GitTfsFolder*") {
+    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$GitTfsFolder", "User")
+}
 
+Write-Host "git-tfs installed at: $GitTfsFolder"
+Write-Host "Testing direct exe..."
+& "$GitTfsFolder\git-tfs.exe" --version
+
+Write-Host "Testing Git alias..."
 git tfs --version
