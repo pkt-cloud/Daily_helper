@@ -1,0 +1,25 @@
+TFVC branch → Git migration
+
+$OrgUrl = "https://dev.azure.com/<organization>"
+$TfvcBranchPath = "$/<TFVCProject>/branches/<required-branch-name>"
+$LocalFolder = "C:\TFVC-Git-Migration\<local-folder-name>"
+$GitRemoteUrl = "https://dev.azure.com/<organization>/<project>/_git/<new-git-repo>"
+$GitBranchName = "main"
+
+mkdir C:\TFVC-Git-Migration -Force
+cd C:\TFVC-Git-Migration
+
+git tfs list-remote-branches $OrgUrl
+
+git tfs clone --branches=none $OrgUrl $TfvcBranchPath $LocalFolder
+
+cd $LocalFolder
+
+git log --oneline --decorate --all
+git rev-list --count HEAD
+
+git branch -M $GitBranchName
+
+git remote add origin $GitRemoteUrl
+git push -u origin $GitBranchName
+git push origin --tags
