@@ -1,0 +1,92 @@
+PowerShell script: migrate branches from .txt one by one
+
+$OrgUrl = "https://dev.azure.com/<organization>"
+$GitRemoteUrl = "https://dev.azure.com/<organization>/<project>/_git/<new-git-repo>"
+$BranchListFile = "C:\TFVC-Git-Migration\branches.txt"
+$BaseFolder = "C:\TFVC-Git-Migration\MultiBranch"
+
+Full script:
+
+$ErrorActionPreference = "Stop"
+
+# =========================
+# Update these values
+# =========================
+$OrgUrl = "https://dev.azure.com/<organization>"
+$GitRemoteUrl = "https://dev.azure.com/<organization>/<project>/_git/<new-git-repo>"
+$BranchListFile = "C:\TFVC-Git-Migration\branches.txt"
+$BaseFolder = "C:\TFVC-Git-Migration\MultiBranch"
+
+# =========================
+# Pre-checks
+# =========================
+git --version
+git lfs --version
+git tfs --version
+
+if (!(Test-Path $BranchListFile)) {
+    throw "Branch list file not found: $BranchListFile"
+}
+
+New-Item -ItemType Directory -Force -Path $BaseFolder | Out-Null
+
+# Read branch paths, remove empty lines, remove duplicates
+$TfvcBranches = Get-Content $BranchListFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne "" -and $_ -notlike "#*" } |
+    Select-Object -Unique
+
+Write-Host "Total unique TFVC branches found: $($TfvcBranches.Count)"
+
+# =========================
+# Migrate one by one
+# =========================
+foreach ($TfvcPath in $TfvcBranches) {
+
+    # Git branch name = last part of TFVC path
+    # Example: $/FIRST/branches/PIP-FIRST -> PIP-FIRST
+    $GitBranch = Split-Path $TfvcPath -Leaf
+
+    # Safe local folder name
+    $SafeFolderName = $GitBranch -replace '[\\/:"*?<>|]', '-'
+    $LocalFolder = Join-Path $BaseFolder $SafeFolderName
+
+    Write-Host ""
+    Write-Host "========================================="
+    Write-Host "Migrating TFVC path : $TfvcPath"
+    Write-Host "Target Git branch  : $GitBranch"
+    Write-Host "Local folder       : $LocalFolder"
+    Write-Host "========================================="
+
+    # Clean old local folder if exists
+    if (Test-Path $LocalFolder) {
+        Remove-Item $LocalFolder -Recurse -Force
+    }
+
+    # Clone TFVC branch with its own history
+    git tfs clone --branches=none $OrgUrl $TfvcPath $LocalFolder
+
+    # Move into migrated repo
+    Set-Location $LocalFolder
+
+    # Rename local branch to target branch name
+    git branch -M $GitBranch
+
+    # Add remote
+    git remote remove origin 2>$null
+    git remote add origin $GitRemoteUrl
+
+    # Push this branch to the same remote Git repo
+    git push -u origin $GitBranch
+
+    # Optional: push tags if any exist
+    git push origin --tags
+
+    # Return to base folder
+    Set-Location $BaseFolder
+
+    Write-Host "Completed migration for: $GitBranch"
+}
+
+Write-Host ""
+Write-Host "All branches migrated successfully."
