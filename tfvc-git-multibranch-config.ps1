@@ -1,0 +1,472 @@
+﻿[CmdletBinding()]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath = (Join-Path $PSScriptRoot 'migration.config.psd1')
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ============================================================
+# LOAD USER CONFIGURATION
+# ============================================================
+
+function Resolve-ConfiguredPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BaseDirectory
+    )
+
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return [System.IO.Path]::GetFullPath($Value)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $Value))
+}
+
+function Get-ConfigBoolean {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$DefaultValue
+    )
+
+    if ($Config.ContainsKey($Name)) {
+        return [bool]$Config[$Name]
+    }
+
+    return $DefaultValue
+}
+
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    throw "Configuration file not found: $ConfigPath"
+}
+
+$ResolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$ConfigDirectory = Split-Path -Parent $ResolvedConfigPath
+$Config = Import-PowerShellDataFile -LiteralPath $ResolvedConfigPath
+
+$RequiredConfigKeys = @(
+    'OrgUrl',
+    'GitRemoteUrl',
+    'BranchListFile',
+    'BaseFolder'
+)
+
+foreach ($Key in $RequiredConfigKeys) {
+    if (-not $Config.ContainsKey($Key) -or
+        [string]::IsNullOrWhiteSpace([string]$Config[$Key])) {
+        throw "Required configuration value is missing or empty: $Key"
+    }
+}
+
+$OrgUrl = [string]$Config.OrgUrl
+$GitRemoteUrl = [string]$Config.GitRemoteUrl
+$BranchListFile = Resolve-ConfiguredPath `
+    -Value ([string]$Config.BranchListFile) `
+    -BaseDirectory $ConfigDirectory
+$BaseFolder = Resolve-ConfiguredPath `
+    -Value ([string]$Config.BaseFolder) `
+    -BaseDirectory $ConfigDirectory
+
+$RemoteName = if ($Config.ContainsKey('RemoteName') -and
+    -not [string]::IsNullOrWhiteSpace([string]$Config.RemoteName)) {
+    [string]$Config.RemoteName
+}
+else {
+    'origin'
+}
+
+$ReuseExistingLocalRepo = Get-ConfigBoolean `
+    -Config $Config `
+    -Name 'ReuseExistingLocalRepo' `
+    -DefaultValue $false
+
+$SkipIfRemoteBranchExists = Get-ConfigBoolean `
+    -Config $Config `
+    -Name 'SkipIfRemoteBranchExists' `
+    -DefaultValue $true
+
+$ContinueOnBranchFailure = Get-ConfigBoolean `
+    -Config $Config `
+    -Name 'ContinueOnBranchFailure' `
+    -DefaultValue $true
+
+$PushTags = Get-ConfigBoolean `
+    -Config $Config `
+    -Name 'PushTags' `
+    -DefaultValue $false
+
+$ConfiguredLogFile = if ($Config.ContainsKey('LogFile') -and
+    -not [string]::IsNullOrWhiteSpace([string]$Config.LogFile)) {
+    [string]$Config.LogFile
+}
+else {
+    '.\logs\tfvc-git-migration.log'
+}
+
+$LogFile = Resolve-ConfiguredPath `
+    -Value $ConfiguredLogFile `
+    -BaseDirectory $ConfigDirectory
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+        [string]$Level = 'INFO'
+    )
+
+    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Write-Host $line
+    Add-Content -LiteralPath $LogFile -Value $line
+}
+
+function Invoke-ExternalCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [switch]$CaptureOutput
+    )
+
+    if ($CaptureOutput) {
+        $output = & $Command @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -ne 0) {
+            $details = ($output | Out-String).Trim()
+            throw "Command failed with exit code $exitCode`: $Command $($Arguments -join ' ')`n$details"
+        }
+
+        return $output
+    }
+
+    & $Command @Arguments
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        throw "Command failed with exit code $exitCode`: $Command $($Arguments -join ' ')"
+    }
+}
+
+function Test-RemoteBranchExists {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BranchName
+    )
+
+    $output = & git ls-remote --heads $RemoteUrl "refs/heads/$BranchName" 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $details = ($output | Out-String).Trim()
+        throw "Unable to query target Git repository for branch '$BranchName'.`n$details"
+    }
+
+    return -not [string]::IsNullOrWhiteSpace(($output | Out-String))
+}
+
+function Get-BranchEntries {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $entries = @()
+    $seenTfvcPaths = @{}
+    $seenGitBranches = @{}
+
+    foreach ($rawLine in Get-Content -LiteralPath $Path) {
+        $line = $rawLine.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+
+        # Supported formats:
+        # $/Project/branches/BranchName
+        # $/Project/branches/BranchName|custom-git-branch-name
+        $parts = $line -split '\|', 2
+        $tfvcPath = $parts[0].Trim()
+
+        if ($tfvcPath -notmatch '^\$/') {
+            throw "Invalid TFVC path in branch-list file: '$tfvcPath'. It must start with '$/'."
+        }
+
+        if ($parts.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($parts[1])) {
+            $gitBranch = $parts[1].Trim()
+        }
+        else {
+            $gitBranch = ($tfvcPath.TrimEnd('/') -split '/')[-1]
+        }
+
+        # Validate the Git branch name.
+        & git check-ref-format --branch $gitBranch *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Invalid Git branch name '$gitBranch' derived from '$tfvcPath'. Use the optional format 'TFVC_PATH|VALID_GIT_BRANCH_NAME'."
+        }
+
+        $tfvcKey = $tfvcPath.ToLowerInvariant()
+        $branchKey = $gitBranch.ToLowerInvariant()
+
+        # Silently ignore exact duplicate TFVC lines while preserving original order.
+        if ($seenTfvcPaths.ContainsKey($tfvcKey)) {
+            continue
+        }
+
+        # Prevent two different TFVC paths from being pushed to the same Git branch.
+        if ($seenGitBranches.ContainsKey($branchKey)) {
+            $existingPath = $seenGitBranches[$branchKey]
+            throw "Git branch-name collision: '$existingPath' and '$tfvcPath' both map to '$gitBranch'. Add an explicit Git branch name using 'TFVC_PATH|GIT_BRANCH_NAME'."
+        }
+
+        $seenTfvcPaths[$tfvcKey] = $true
+        $seenGitBranches[$branchKey] = $tfvcPath
+
+        $entries += [PSCustomObject]@{
+            TfvcPath  = $tfvcPath
+            GitBranch = $gitBranch
+        }
+    }
+
+    return $entries
+}
+
+# ============================================================
+# PRE-CHECKS
+# ============================================================
+
+if ($OrgUrl -match '<.+>' -or $GitRemoteUrl -match '<.+>') {
+    throw "Update OrgUrl and GitRemoteUrl in the configuration file: $ResolvedConfigPath"
+}
+
+if (-not (Test-Path -LiteralPath $BranchListFile)) {
+    throw "Branch-list file not found: $BranchListFile"
+}
+
+$logDirectory = Split-Path -Parent $LogFile
+if (-not [string]::IsNullOrWhiteSpace($logDirectory)) {
+    New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+}
+
+New-Item -ItemType Directory -Force -Path $BaseFolder | Out-Null
+
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    throw 'Git is not installed or is not available in PATH.'
+}
+
+Write-Log 'Checking installed tools.'
+Invoke-ExternalCommand -Command 'git' -Arguments @('--version')
+Invoke-ExternalCommand -Command 'git' -Arguments @('tfs', '--version')
+
+try {
+    Invoke-ExternalCommand -Command 'git' -Arguments @('lfs', '--version')
+}
+catch {
+    Write-Log 'Git LFS was not detected. It is not required for the TFVC history conversion itself.' 'WARN'
+}
+
+Write-Log 'Checking access to the target Git repository.'
+$null = Invoke-ExternalCommand -Command 'git' -Arguments @('ls-remote', $GitRemoteUrl, 'HEAD') -CaptureOutput
+
+$branchEntries = @(Get-BranchEntries -Path $BranchListFile)
+
+if ($branchEntries.Count -eq 0) {
+    throw "No usable TFVC branch paths were found in: $BranchListFile"
+}
+
+Write-Log "Unique branches to process: $($branchEntries.Count)"
+
+# ============================================================
+# MIGRATION
+# ============================================================
+
+$results = @()
+
+foreach ($entry in $branchEntries) {
+    $tfvcPath = $entry.TfvcPath
+    $gitBranch = $entry.GitBranch
+
+    # Use a Windows-safe folder name. This does not change the Git branch name.
+    $safeFolderName = $gitBranch -replace '[\\/:*?"<>| ]', '_'
+    $localFolder = Join-Path $BaseFolder $safeFolderName
+    $locationWasPushed = $false
+
+    Write-Log '------------------------------------------------------------'
+    Write-Log "TFVC path : $tfvcPath"
+    Write-Log "Git branch: $gitBranch"
+    Write-Log "Local path: $localFolder"
+
+    try {
+        if ($SkipIfRemoteBranchExists -and
+            (Test-RemoteBranchExists -RemoteUrl $GitRemoteUrl -BranchName $gitBranch)) {
+
+            Write-Log "Remote branch already exists; skipped: $gitBranch" 'WARN'
+
+            $results += [PSCustomObject]@{
+                TfvcPath  = $tfvcPath
+                GitBranch = $gitBranch
+                Status    = 'Skipped - already exists'
+            }
+
+            continue
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $localFolder '.git')) {
+            if ($ReuseExistingLocalRepo) {
+                Write-Log "Reusing existing local Git repository: $localFolder"
+
+                $insideRepo = Invoke-ExternalCommand `
+                    -Command 'git' `
+                    -Arguments @('-C', $localFolder, 'rev-parse', '--is-inside-work-tree') `
+                    -CaptureOutput
+
+                if (($insideRepo | Select-Object -First 1).ToString().Trim() -ne 'true') {
+                    throw "Existing folder is not a valid Git working tree: $localFolder"
+                }
+            }
+            else {
+                Write-Log "Removing existing local repository before recloning: $localFolder" 'WARN'
+                Remove-Item -LiteralPath $localFolder -Recurse -Force
+
+                Write-Log "Cloning TFVC branch and history: $tfvcPath"
+                Invoke-ExternalCommand `
+                    -Command 'git' `
+                    -Arguments @('tfs', 'clone', '--branches=none', $OrgUrl, $tfvcPath, $localFolder)
+            }
+        }
+        else {
+            if (Test-Path -LiteralPath $localFolder) {
+                Write-Log "Removing non-Git folder: $localFolder" 'WARN'
+                Remove-Item -LiteralPath $localFolder -Recurse -Force
+            }
+
+            Write-Log "Cloning TFVC branch and history: $tfvcPath"
+            Invoke-ExternalCommand `
+                -Command 'git' `
+                -Arguments @('tfs', 'clone', '--branches=none', $OrgUrl, $tfvcPath, $localFolder)
+        }
+
+        Push-Location $localFolder
+        $locationWasPushed = $true
+
+        Write-Log "Renaming the current local Git branch to: $gitBranch"
+        Invoke-ExternalCommand -Command 'git' -Arguments @('branch', '-M', $gitBranch)
+
+        # 'origin' is only a local alias. Add it when missing; update it when present.
+        $existingRemotes = @(
+            Invoke-ExternalCommand -Command 'git' -Arguments @('remote') -CaptureOutput |
+                ForEach-Object { $_.ToString().Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+
+        if ($existingRemotes -contains $RemoteName) {
+            Write-Log "Remote '$RemoteName' exists; updating its URL."
+            Invoke-ExternalCommand `
+                -Command 'git' `
+                -Arguments @('remote', 'set-url', $RemoteName, $GitRemoteUrl)
+        }
+        else {
+            Write-Log "Adding remote '$RemoteName'."
+            Invoke-ExternalCommand `
+                -Command 'git' `
+                -Arguments @('remote', 'add', $RemoteName, $GitRemoteUrl)
+        }
+
+        $configuredRemoteUrl = Invoke-ExternalCommand `
+            -Command 'git' `
+            -Arguments @('remote', 'get-url', $RemoteName) `
+            -CaptureOutput
+
+        Write-Log "Configured remote URL: $(($configuredRemoteUrl | Select-Object -First 1).ToString().Trim())"
+
+        Write-Log "Pushing Git branch: $gitBranch"
+        Invoke-ExternalCommand `
+            -Command 'git' `
+            -Arguments @('push', '-u', $RemoteName, "HEAD:refs/heads/$gitBranch")
+
+        if ($PushTags) {
+            $tags = @(
+                Invoke-ExternalCommand -Command 'git' -Arguments @('tag') -CaptureOutput |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_.ToString()) }
+            )
+
+            if ($tags.Count -gt 0) {
+                Write-Log "Pushing $($tags.Count) tag(s)."
+                try {
+                    Invoke-ExternalCommand -Command 'git' -Arguments @('push', $RemoteName, '--tags')
+                }
+                catch {
+                    Write-Log "Branch was pushed, but tag push failed: $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+
+        Write-Log "Completed successfully: $gitBranch" 'SUCCESS'
+
+        $results += [PSCustomObject]@{
+            TfvcPath  = $tfvcPath
+            GitBranch = $gitBranch
+            Status    = 'Completed'
+        }
+    }
+    catch {
+        Write-Log "Failed: $gitBranch. $($_.Exception.Message)" 'ERROR'
+
+        $results += [PSCustomObject]@{
+            TfvcPath  = $tfvcPath
+            GitBranch = $gitBranch
+            Status    = 'Failed'
+        }
+
+        if (-not $ContinueOnBranchFailure) {
+            throw
+        }
+    }
+    finally {
+        if ($locationWasPushed) {
+            Pop-Location
+        }
+    }
+}
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+Write-Host ''
+Write-Host 'Migration summary:'
+$results | Format-Table -AutoSize
+
+$failedCount = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+$completedCount = @($results | Where-Object { $_.Status -eq 'Completed' }).Count
+$skippedCount = @($results | Where-Object { $_.Status -like 'Skipped*' }).Count
+
+Write-Log "Summary: completed=$completedCount, skipped=$skippedCount, failed=$failedCount"
+
+if ($failedCount -gt 0) {
+    throw "$failedCount branch migration(s) failed. Review the console output and log file: $LogFile"
+}
+
+Write-Log 'All requested branches were processed successfully.' 'SUCCESS'
