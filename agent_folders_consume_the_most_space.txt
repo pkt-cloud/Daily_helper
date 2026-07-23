@@ -1,0 +1,30 @@
+$paths = @(
+    "C:\agent\_work",
+    "C:\agent\_diag",
+    "C:\azagent\A1\_work",
+    "C:\azagent\A1\_diag",
+    "C:\Windows\Temp",
+    "C:\Temp",
+    "$env:USERPROFILE\.nuget\packages",
+    "C:\Program Files\Microsoft Visual Studio"
+)
+
+$results = foreach ($path in $paths) {
+    if (Test-Path $path) {
+        Write-Host "Checking $path ..."
+
+        $size = Get-ChildItem -LiteralPath $path `
+            -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum
+
+        [PSCustomObject]@{
+            Path   = $path
+            SizeGB = [math]::Round($size.Sum / 1GB, 2)
+            Files  = $size.Count
+        }
+    }
+}
+
+$results |
+Sort-Object SizeGB -Descending |
+Format-Table -AutoSize
