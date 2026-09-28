@@ -1,0 +1,467 @@
+param(
+    [string]$Root = "C:\Packer\azure-devops-agent-image",
+    [string]$VMName = "win2022-azdo-gen1-m1",
+    [string]$SwitchName = "PackerNAT",
+    [string]$NatName = "PackerNAT",
+    [string]$Subnet = "192.168.250.0/24",
+    [string]$HostIP = "192.168.250.1",
+    [string]$GuestIP = "192.168.250.10",
+    [int]$PrefixLength = 24,
+    [switch]$StartBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Utf8NoBom {
+    param([string]$Path,[string]$Content)
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path,$Content,$enc)
+}
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run this script from PowerShell as Administrator."
+}
+
+$packerDir = Join-Path $Root "packer"
+$answerDir = Join-Path $Root "answer-files"
+$outputDir = Join-Path $Root "output"
+$varsFile  = Join-Path $packerDir "local.auto.pkrvars.hcl"
+$hclPath   = Join-Path $packerDir "windows2022.pkr.hcl"
+$xmlPath   = Join-Path $answerDir "Autounattend.xml.pkrtpl"
+$bootPath  = Join-Path $answerDir "bootstrap-winrm.ps1"
+
+foreach ($p in @($packerDir,$answerDir,$outputDir)) {
+    New-Item -ItemType Directory -Path $p -Force | Out-Null
+}
+
+if (-not (Test-Path $varsFile)) { throw "Missing variables file: $varsFile" }
+if (-not (Get-Command packer -ErrorAction SilentlyContinue)) { throw "Packer is not available in PATH." }
+
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$backupDir = Join-Path $Root "backups\pre-packernat-$stamp"
+New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+
+foreach ($file in @($hclPath,$xmlPath,$bootPath,$varsFile)) {
+    if (Test-Path $file) { Copy-Item $file $backupDir -Force }
+}
+Write-Host "Backup created: $backupDir" -ForegroundColor Green
+
+if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
+    Stop-VM $VMName -TurnOff -Force -ErrorAction SilentlyContinue
+    Remove-VM $VMName -Force
+}
+
+$buildOutput = Join-Path $outputDir $VMName
+if (Test-Path $buildOutput) {
+    Remove-Item $buildOutput -Recurse -Force
+}
+
+$existingSwitch = Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue
+if (-not $existingSwitch) {
+    New-VMSwitch -Name $SwitchName -SwitchType Internal | Out-Null
+}
+elseif ($existingSwitch.SwitchType -ne "Internal") {
+    throw "A Hyper-V switch named '$SwitchName' exists but is not Internal."
+}
+
+$hostAdapterAlias = "vEthernet ($SwitchName)"
+$deadline = (Get-Date).AddSeconds(20)
+do {
+    $hostAdapter = Get-NetAdapter -Name $hostAdapterAlias -ErrorAction SilentlyContinue
+    if ($hostAdapter) { break }
+    Start-Sleep -Seconds 1
+} while ((Get-Date) -lt $deadline)
+
+if (-not $hostAdapter) { throw "Host adapter '$hostAdapterAlias' was not created." }
+
+$hostIPExisting = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $HostIP -ErrorAction SilentlyContinue
+if ($hostIPExisting -and $hostIPExisting.InterfaceAlias -ne $hostAdapterAlias) {
+    throw "$HostIP is already assigned to '$($hostIPExisting.InterfaceAlias)'. Choose another subnet."
+}
+
+$hostIPOnSwitch = Get-NetIPAddress -InterfaceAlias $hostAdapterAlias -AddressFamily IPv4 -IPAddress $HostIP -ErrorAction SilentlyContinue
+if (-not $hostIPOnSwitch) {
+    New-NetIPAddress -InterfaceAlias $hostAdapterAlias -IPAddress $HostIP -PrefixLength $PrefixLength | Out-Null
+}
+
+$existingNat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue
+if (-not $existingNat) {
+    $overlap = Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.InternalIPInterfaceAddressPrefix -eq $Subnet }
+    if ($overlap) { throw "Subnet $Subnet already used by NAT '$($overlap.Name)'." }
+    New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $Subnet | Out-Null
+}
+elseif ($existingNat.InternalIPInterfaceAddressPrefix -ne $Subnet) {
+    throw "NAT '$NatName' exists with prefix '$($existingNat.InternalIPInterfaceAddressPrefix)'."
+}
+
+$varsText = Get-Content $varsFile -Raw
+foreach ($required in @("iso_url","iso_sha256","image_index","admin_username","admin_password")) {
+    if ($varsText -notmatch "(?m)^\s*$required\s*=") { throw "Required variable '$required' missing from $varsFile" }
+}
+
+if ($varsText -notmatch '(?m)^\s*admin_username\s*=\s*"Administrator"\s*$') {
+    throw 'Set admin_username = "Administrator" in local.auto.pkrvars.hcl.'
+}
+if ($varsText -notmatch '(?m)^\s*image_index\s*=\s*4\s*$') {
+    throw 'Set image_index = 4 in local.auto.pkrvars.hcl.'
+}
+
+$passwordMatch = [regex]::Match($varsText,'(?m)^\s*admin_password\s*=\s*"([^"]*)"\s*$')
+if ($passwordMatch.Success -and $passwordMatch.Groups[1].Value -match '[&<>]') {
+    throw "Temporary admin_password contains &, <, or >. Use a temporary password without XML-special characters."
+}
+
+if ($varsText -match '(?m)^\s*switch_name\s*=') {
+    $varsText = [regex]::Replace($varsText,'(?m)^\s*switch_name\s*=\s*"[^"]*"\s*$',('switch_name = "' + $SwitchName + '"'))
+}
+else {
+    $varsText += "`r`nswitch_name = `"$SwitchName`"`r`n"
+}
+Write-Utf8NoBom -Path $varsFile -Content $varsText
+
+$bootstrap = @"
+`$ErrorActionPreference = "Stop"
+`$Log = "C:\packer-winrm-bootstrap.log"
+
+function Log {
+    param([string]`$Message)
+    "`$(Get-Date -Format o)  `$Message" | Add-Content -Path `$Log -Encoding ASCII
+}
+
+"`$(Get-Date -Format o)  START" | Set-Content -Path `$Log -Encoding ASCII
+
+try {
+    `$nic = Get-NetAdapter |
+        Where-Object { `$_.Status -ne "Disabled" -and `$_.HardwareInterface } |
+        Sort-Object ifIndex |
+        Select-Object -First 1
+
+    if (-not `$nic) { throw "No usable network adapter found." }
+
+    Log "Using NIC: `$(`$nic.Name), ifIndex=`$(`$nic.ifIndex)"
+
+    Set-NetIPInterface -InterfaceIndex `$nic.ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
+
+    Get-NetIPAddress -InterfaceIndex `$nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { `$_.IPAddress -ne "$GuestIP" -and `$_.IPAddress -notlike "169.254.*" } |
+        Remove-NetIPAddress -Confirm:`$false -ErrorAction SilentlyContinue
+
+    Get-NetRoute -InterfaceIndex `$nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { `$_.DestinationPrefix -eq "0.0.0.0/0" } |
+        Remove-NetRoute -Confirm:`$false -ErrorAction SilentlyContinue
+
+    `$existingIP = Get-NetIPAddress -InterfaceIndex `$nic.ifIndex -AddressFamily IPv4 -IPAddress "$GuestIP" -ErrorAction SilentlyContinue
+    if (-not `$existingIP) {
+        New-NetIPAddress -InterfaceIndex `$nic.ifIndex -IPAddress "$GuestIP" -PrefixLength $PrefixLength -DefaultGateway "$HostIP" | Out-Null
+    }
+
+    Log "Static IPv4 configured: $GuestIP/$PrefixLength gateway $HostIP"
+
+    New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
+        -Name "LocalAccountTokenFilterPolicy" -PropertyType DWord -Value 1 -Force | Out-Null
+
+    Set-Service WinRM -StartupType Automatic
+    Enable-PSRemoting -SkipNetworkProfileCheck -Force
+    Start-Service WinRM
+
+    Set-Item WSMan:\localhost\Service\Auth\Basic -Value `$true
+    Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value `$true
+
+    Get-NetFirewallRule -DisplayName "Packer WinRM 5985" -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+    New-NetFirewallRule -DisplayName "Packer WinRM 5985" `
+        -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 `
+        -RemoteAddress "$HostIP" | Out-Null
+
+    Log "WinRM Basic enabled temporarily; 5985 restricted to host $HostIP"
+
+    Start-Sleep -Seconds 3
+
+    "READY `$(Get-Date -Format o)" | Set-Content "C:\packer-winrm-ready.txt" -Encoding ASCII
+    Log "SUCCESS"
+}
+catch {
+    Log ("ERROR: " + `$_.Exception.Message)
+    throw
+}
+"@
+
+$unattend = @'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>Primary</Type><Size>500</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>2</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID><Active>true</Active>
+              <Format>NTFS</Format><Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+              <Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+        <WillShowUI>OnError</WillShowUI>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <Value>${image_index}</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>Packer</FullName>
+        <Organization>GoldenImageBuild</Organization>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>PACKER-GEN1</ComputerName>
+      <TimeZone>India Standard Time</TimeZone>
+    </component>
+
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Configure static network and WinRM for Packer</Description>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item 'A:\bootstrap-winrm.ps1' 'C:\bootstrap-winrm.ps1' -Force; &amp; 'C:\bootstrap-winrm.ps1'"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>${admin_password}</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+    </component>
+  </settings>
+
+</unattend>
+'@
+
+$hcl = @"
+packer {
+  required_plugins {
+    hyperv = {
+      source  = "github.com/hashicorp/hyperv"
+      version = "= 1.1.5"
+    }
+  }
+}
+
+variable "iso_url" { type = string }
+variable "iso_sha256" { type = string }
+variable "image_index" { type = number }
+
+variable "switch_name" {
+  type    = string
+  default = "$SwitchName"
+}
+
+variable "admin_username" {
+  type    = string
+  default = "Administrator"
+}
+
+variable "admin_password" {
+  type      = string
+  sensitive = true
+}
+
+locals {
+  autounattend = templatefile("`${path.root}/../answer-files/Autounattend.xml.pkrtpl", {
+    image_index    = var.image_index
+    admin_password = var.admin_password
+  })
+
+  winrm_bootstrap = file("`${path.root}/../answer-files/bootstrap-winrm.ps1")
+}
+
+source "hyperv-iso" "windows2022" {
+  vm_name = "$VMName"
+
+  iso_url      = var.iso_url
+  iso_checksum = "sha256:`${var.iso_sha256}"
+
+  generation = 1
+
+  cpus      = 2
+  memory    = 3072
+  disk_size = 65536
+
+  switch_name       = var.switch_name
+  first_boot_device = "DVD"
+
+  boot_wait = "1s"
+  boot_command = [
+    "<enter><wait1s><enter><wait1s><enter>"
+  ]
+
+  communicator   = "winrm"
+  winrm_host     = "$GuestIP"
+  winrm_port     = 5985
+  winrm_username = var.admin_username
+  winrm_password = var.admin_password
+  winrm_no_proxy = true
+  winrm_timeout  = "30m"
+
+  headless = false
+
+  floppy_content = {
+    "Autounattend.xml"    = local.autounattend
+    "bootstrap-winrm.ps1" = local.winrm_bootstrap
+  }
+
+  output_directory = "`${path.root}/../output/$VMName"
+
+  shutdown_command = "shutdown.exe /s /t 5 /f"
+  shutdown_timeout = "20m"
+}
+
+build {
+  sources = ["source.hyperv-iso.windows2022"]
+
+  provisioner "powershell" {
+    inline = [
+      "'Packer connected successfully' | Out-File -FilePath C:\\packer-build-ok.txt -Encoding ascii",
+      "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,OSArchitecture | Format-List"
+    ]
+  }
+}
+"@
+
+Write-Utf8NoBom -Path $bootPath -Content $bootstrap
+Write-Utf8NoBom -Path $xmlPath  -Content $unattend
+Write-Utf8NoBom -Path $hclPath  -Content $hcl
+
+try {
+    [xml](Get-Content $xmlPath -Raw) | Out-Null
+    Write-Host "Autounattend XML syntax: VALID" -ForegroundColor Green
+}
+catch {
+    throw "Autounattend XML invalid: $($_.Exception.Message)"
+}
+
+Push-Location $packerDir
+try {
+    & packer init .
+    if ($LASTEXITCODE -ne 0) { throw "packer init failed." }
+
+    & packer fmt .
+    if ($LASTEXITCODE -ne 0) { throw "packer fmt failed." }
+
+    & packer validate .
+    if ($LASTEXITCODE -ne 0) { throw "packer validate failed." }
+
+    Write-Host ""
+    Write-Host "PACKERNAT STATIC-WINRM CONFIGURATION VALIDATED." -ForegroundColor Green
+    Write-Host "Switch : $SwitchName"
+    Write-Host "Subnet : $Subnet"
+    Write-Host "Host   : $HostIP"
+    Write-Host "Guest  : $GuestIP"
+    Write-Host ""
+    Write-Warning "Milestone-1 temporarily uses Basic WinRM + AllowUnencrypted on the isolated Packer network, with 5985 restricted to host $HostIP. We will harden WinRM before producing the final golden image."
+
+    if ($StartBuild) {
+        & packer build -on-error=abort .
+        exit $LASTEXITCODE
+    }
+    else {
+        Write-Host ""
+        Write-Host "Next command:"
+        Write-Host "  cd `"$packerDir`""
+        Write-Host "  packer build -on-error=abort ."
+    }
+}
+finally {
+    Pop-Location
+}
