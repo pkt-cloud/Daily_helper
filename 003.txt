@@ -1,0 +1,192 @@
+$ErrorActionPreference = 'Stop'
+
+Write-Host "======================================"
+Write-Host " Legacy NuGet self-healing"
+Write-Host "======================================"
+
+Write-Host "Agent       : $env:AGENT_NAME"
+Write-Host "User        : $env:USERNAME"
+Write-Host "UserProfile : $env:USERPROFILE"
+
+$msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"
+
+$root = Join-Path $env:BUILD_SOURCESDIRECTORY `
+    "Release3_2025-Q4-PIPBranding\Honeywell.HLS.FIRST"
+
+$lockFile = Join-Path $root `
+    "Honeywell.HLS.FIRST.Resources\project.lock.json"
+
+if (-not (Test-Path $msbuild)) {
+    throw "MSBuild not found: $msbuild"
+}
+
+if (-not (Test-Path $lockFile)) {
+    throw "project.lock.json not found: $lockFile"
+}
+
+# Use the Azure DevOps agent service account's own writable NuGet cache.
+$packageRoot = Join-Path $env:USERPROFILE ".nuget\packages"
+
+$packagePath = Join-Path $packageRoot `
+    "microsoft.netcore.portable.compatibility\1.0.0"
+
+$nuspec = Join-Path $packagePath `
+    "microsoft.netcore.portable.compatibility.nuspec"
+
+$sha = Join-Path $packagePath `
+    "microsoft.netcore.portable.compatibility.1.0.0.nupkg.sha512"
+
+$metadata = Join-Path $packagePath ".nupkg.metadata"
+
+Write-Host ""
+Write-Host "NuGet cache  : $packageRoot"
+Write-Host "Package path : $packagePath"
+
+$packageHealthy =
+    (Test-Path $packagePath) -and
+    (Test-Path $nuspec) -and
+    (Test-Path $sha) -and
+    (Test-Path $metadata)
+
+if ($packageHealthy) {
+    Write-Host ""
+    Write-Host "Package already correctly installed."
+}
+else {
+    Write-Host ""
+    Write-Host "Package missing or incomplete."
+    Write-Host "Restoring clean package into agent-owned cache..."
+
+    New-Item -ItemType Directory `
+        -Path $packageRoot `
+        -Force | Out-Null
+
+    if (Test-Path $packagePath) {
+        Remove-Item $packagePath `
+            -Recurse `
+            -Force
+    }
+
+    $bootstrapDir = Join-Path $env:AGENT_TEMPDIRECTORY `
+        "legacy-nuget-bootstrap"
+
+    if (Test-Path $bootstrapDir) {
+        Remove-Item $bootstrapDir -Recurse -Force
+    }
+
+    New-Item -ItemType Directory `
+        -Path $bootstrapDir `
+        -Force | Out-Null
+
+    $bootstrapProject = Join-Path $bootstrapDir `
+        "LegacyNuGetBootstrap.csproj"
+
+    $projectContent = @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net46</TargetFramework>
+    <RestorePackagesPath>$packageRoot</RestorePackagesPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETCore.Portable.Compatibility"
+                      Version="1.0.0" />
+  </ItemGroup>
+</Project>
+"@
+
+    [System.IO.File]::WriteAllText(
+        $bootstrapProject,
+        $projectContent
+    )
+
+    Write-Host ""
+    Write-Host "Restoring Microsoft.NETCore.Portable.Compatibility 1.0.0..."
+
+    & $msbuild "$bootstrapProject" `
+        /nologo `
+        /nr:false `
+        /t:Restore `
+        /p:RestorePackagesPath="$packageRoot" `
+        /v:minimal
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bootstrap NuGet restore failed with exit code $LASTEXITCODE"
+    }
+
+    if (-not (Test-Path $nuspec)) {
+        throw "Package restore incomplete: nuspec missing"
+    }
+
+    if (-not (Test-Path $sha)) {
+        throw "Package restore incomplete: sha512 missing"
+    }
+
+    if (-not (Test-Path $metadata)) {
+        throw "Package restore incomplete: .nupkg.metadata missing"
+    }
+
+    Write-Host ""
+    Write-Host "Package successfully restored."
+}
+
+Write-Host ""
+Write-Host "Updating legacy project.lock.json package path..."
+
+$lockText = Get-Content $lockFile -Raw
+
+$match = [regex]::Match(
+    $lockText,
+    '"packagesPath"\s*:\s*"([^"]+)"'
+)
+
+if (-not $match.Success) {
+    throw "packagesPath not found in project.lock.json"
+}
+
+$oldJsonPath = $match.Groups[1].Value
+
+$newPath = $packageRoot.TrimEnd('\') + '\'
+$newJsonPath = $newPath.Replace('\', '\\')
+
+Write-Host "Old package root: $oldJsonPath"
+Write-Host "New package root: $newJsonPath"
+
+$newLockText = $lockText.Replace(
+    $oldJsonPath,
+    $newJsonPath
+)
+
+if ($newLockText -eq $lockText) {
+    Write-Host "No lock-file path change required."
+}
+else {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+    [System.IO.File]::WriteAllText(
+        $lockFile,
+        $newLockText,
+        $utf8
+    )
+
+    Write-Host "project.lock.json updated for this agent workspace."
+}
+
+Write-Host ""
+Write-Host "===== FINAL VALIDATION ====="
+
+Write-Host "Package root : $packageRoot"
+Write-Host "NUSPEC       : $(Test-Path $nuspec)"
+Write-Host "SHA512       : $(Test-Path $sha)"
+Write-Host "Metadata     : $(Test-Path $metadata)"
+
+if (
+    -not (Test-Path $nuspec) -or
+    -not (Test-Path $sha) -or
+    -not (Test-Path $metadata)
+) {
+    throw "Final validation failed."
+}
+
+Write-Host ""
+Write-Host "Legacy NuGet dependency is ready."
