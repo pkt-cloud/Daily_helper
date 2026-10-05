@@ -1,0 +1,211 @@
+$ErrorActionPreference = 'Stop'
+
+Write-Host "======================================"
+Write-Host " Legacy NuGet dependency self-healing"
+Write-Host "======================================"
+
+Write-Host "Agent       : $env:AGENT_NAME"
+Write-Host "User        : $env:USERNAME"
+Write-Host "UserProfile : $env:USERPROFILE"
+
+$msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"
+
+$root = Join-Path $env:BUILD_SOURCESDIRECTORY `
+    "Release3_2025-Q4-PIPBranding\Honeywell.HLS.FIRST"
+
+$lockFile = Join-Path $root `
+    "Honeywell.HLS.FIRST.Resources\project.lock.json"
+
+if (-not (Test-Path $msbuild)) {
+    throw "MSBuild not found: $msbuild"
+}
+
+if (-not (Test-Path $lockFile)) {
+    throw "project.lock.json not found: $lockFile"
+}
+
+# Use the Azure DevOps agent service account's own writable global NuGet cache.
+$packageRoot = Join-Path $env:USERPROFILE ".nuget\packages"
+
+Write-Host ""
+Write-Host "NuGet cache : $packageRoot"
+
+New-Item -ItemType Directory `
+    -Path $packageRoot `
+    -Force | Out-Null
+
+# Always recreate the temporary bootstrap project.
+# This makes NuGet reevaluate the dependency graph while already-cached
+# packages make subsequent runs very quick.
+$bootstrapDir = Join-Path $env:AGENT_TEMPDIRECTORY `
+    "legacy-nuget-bootstrap"
+
+if (Test-Path $bootstrapDir) {
+    Remove-Item $bootstrapDir -Recurse -Force
+}
+
+New-Item -ItemType Directory `
+    -Path $bootstrapDir `
+    -Force | Out-Null
+
+$bootstrapProject = Join-Path $bootstrapDir `
+    "LegacyNuGetBootstrap.csproj"
+
+# Restore BOTH top-level dependencies from the legacy project.json.
+# Microsoft.NETCore 5.0.0 brings in Microsoft.CSharp 4.0.0 and the
+# other System.* dependencies required by the legacy lock file.
+$projectContent = @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net46</TargetFramework>
+    <RestorePackagesPath>$packageRoot</RestorePackagesPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETCore"
+                      Version="5.0.0" />
+
+    <PackageReference Include="Microsoft.NETCore.Portable.Compatibility"
+                      Version="1.0.0" />
+  </ItemGroup>
+</Project>
+"@
+
+[System.IO.File]::WriteAllText(
+    $bootstrapProject,
+    $projectContent
+)
+
+Write-Host ""
+Write-Host "Restoring complete legacy NuGet dependency graph..."
+Write-Host "  Microsoft.NETCore 5.0.0"
+Write-Host "  Microsoft.NETCore.Portable.Compatibility 1.0.0"
+
+& $msbuild "$bootstrapProject" `
+    /nologo `
+    /nr:false `
+    /t:Restore `
+    /p:RestorePackagesPath="$packageRoot" `
+    /p:RestoreForce=true `
+    /v:minimal
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Legacy NuGet bootstrap restore failed with exit code $LASTEXITCODE"
+}
+
+Write-Host ""
+Write-Host "Bootstrap restore completed."
+
+# Validate several key packages from the legacy dependency graph.
+$requiredPackages = @(
+    @{
+        Id      = "microsoft.netcore"
+        Version = "5.0.0"
+    },
+    @{
+        Id      = "microsoft.netcore.portable.compatibility"
+        Version = "1.0.0"
+    },
+    @{
+        Id      = "microsoft.csharp"
+        Version = "4.0.0"
+    }
+)
+
+Write-Host ""
+Write-Host "===== PACKAGE VALIDATION ====="
+
+foreach ($package in $requiredPackages) {
+
+    $packagePath = Join-Path $packageRoot `
+        "$($package.Id)\$($package.Version)"
+
+    $metadata = Join-Path $packagePath ".nupkg.metadata"
+
+    $nuspec = Get-ChildItem $packagePath `
+        -Filter "*.nuspec" `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    $sha = Get-ChildItem $packagePath `
+        -Filter "*.nupkg.sha512" `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    Write-Host ""
+    Write-Host "$($package.Id) $($package.Version)"
+    Write-Host "  Path     : $packagePath"
+    Write-Host "  Directory: $(Test-Path $packagePath)"
+    Write-Host "  NUSPEC   : $([bool]$nuspec)"
+    Write-Host "  SHA512   : $([bool]$sha)"
+    Write-Host "  Metadata : $(Test-Path $metadata)"
+
+    if (
+        -not (Test-Path $packagePath) -or
+        -not $nuspec -or
+        -not $sha -or
+        -not (Test-Path $metadata)
+    ) {
+        throw "Required NuGet package is missing or incomplete: $($package.Id) $($package.Version)"
+    }
+}
+
+# The checked-in legacy project.lock.json contains an old user-specific
+# global package path. Replace that path only in this agent workspace.
+Write-Host ""
+Write-Host "Updating legacy project.lock.json package path..."
+
+$lockText = Get-Content $lockFile -Raw
+
+$match = [regex]::Match(
+    $lockText,
+    '"packagesPath"\s*:\s*"([^"]+)"'
+)
+
+if (-not $match.Success) {
+    throw "packagesPath not found in project.lock.json"
+}
+
+$oldJsonPath = $match.Groups[1].Value
+
+$newPath = $packageRoot.TrimEnd('\') + '\'
+$newJsonPath = $newPath.Replace('\', '\\')
+
+Write-Host "Old package root: $oldJsonPath"
+Write-Host "New package root: $newJsonPath"
+
+# Replace every occurrence of the old package root in the lock file,
+# including packageFolders and project restore metadata.
+$newLockText = $lockText.Replace(
+    $oldJsonPath,
+    $newJsonPath
+)
+
+if ($newLockText -eq $lockText) {
+    Write-Host "No lock-file path change required."
+}
+else {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+    [System.IO.File]::WriteAllText(
+        $lockFile,
+        $newLockText,
+        $utf8
+    )
+
+    Write-Host "project.lock.json updated for this agent workspace."
+}
+
+Write-Host ""
+Write-Host "===== FINAL VALIDATION ====="
+Write-Host "NuGet cache : $packageRoot"
+
+foreach ($package in $requiredPackages) {
+    $packagePath = Join-Path $packageRoot `
+        "$($package.Id)\$($package.Version)"
+
+    Write-Host "$($package.Id) $($package.Version) : $(Test-Path $packagePath)"
+}
+
+Write-Host ""
+Write-Host "Complete legacy NuGet dependency graph is ready."
