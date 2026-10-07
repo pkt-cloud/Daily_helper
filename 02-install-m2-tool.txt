@@ -1,0 +1,235 @@
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$Log = "C:\packer-m2-tools.log"
+
+function Log {
+    param([string]$Message)
+    "$(Get-Date -Format o)  $Message" | Add-Content -Path $Log -Encoding ASCII
+}
+
+"$(Get-Date -Format o)  START MILESTONE 2" | Set-Content -Path $Log -Encoding ASCII
+
+try {
+    # =========================================================
+    # Packer HTTP server and pinned installer versions
+    # =========================================================
+
+    $BaseUrl = "http://192.168.250.1:8080"
+
+    $GitVersion   = "2.56.0"
+    $GitFileName  = "Git-2.56.0-64-bit.exe"
+    $GitInstaller = "C:\Windows\Temp\$GitFileName"
+
+    $AzVersion    = "2.90.0"
+    $AzFileName   = "azure-cli-2.90.0-x64.msi"
+    $AzInstaller  = "C:\Windows\Temp\$AzFileName"
+
+    # =========================================================
+    # Download installers from Packer HTTP server
+    # =========================================================
+
+    Log "BEGIN: Download Git from $BaseUrl/$GitFileName"
+
+    Invoke-WebRequest `
+        -Uri "$BaseUrl/$GitFileName" `
+        -OutFile $GitInstaller `
+        -UseBasicParsing
+
+    Log "END: Download Git"
+
+    Log "BEGIN: Download Azure CLI from $BaseUrl/$AzFileName"
+
+    Invoke-WebRequest `
+        -Uri "$BaseUrl/$AzFileName" `
+        -OutFile $AzInstaller `
+        -UseBasicParsing
+
+    Log "END: Download Azure CLI"
+
+    # =========================================================
+    # Validate downloaded files
+    # =========================================================
+
+    Log "BEGIN: Validate downloaded installer files"
+
+    if (-not (Test-Path $GitInstaller)) {
+        throw "Git installer not found after download: $GitInstaller"
+    }
+
+    if (-not (Test-Path $AzInstaller)) {
+        throw "Azure CLI installer not found after download: $AzInstaller"
+    }
+
+    $GitFile = Get-Item $GitInstaller
+    $AzFile  = Get-Item $AzInstaller
+
+    if ($GitFile.Length -le 0) {
+        throw "Git installer is empty: $GitInstaller"
+    }
+
+    if ($AzFile.Length -le 0) {
+        throw "Azure CLI installer is empty: $AzInstaller"
+    }
+
+    Log "Git installer size: $($GitFile.Length) bytes"
+    Log "Azure CLI installer size: $($AzFile.Length) bytes"
+    Log "END: Validate downloaded installer files"
+
+    # =========================================================
+    # Install Git
+    # =========================================================
+
+    Log "BEGIN: Install Git $GitVersion"
+
+    $GitArguments = @(
+        "/VERYSILENT"
+        "/NORESTART"
+        "/NOCANCEL"
+        "/SP-"
+        "/CLOSEAPPLICATIONS"
+        "/RESTARTAPPLICATIONS"
+        '/COMPONENTS="icons,ext\reg\shellhere,assoc,assoc_sh"'
+    )
+
+    $GitProcess = Start-Process `
+        -FilePath $GitInstaller `
+        -ArgumentList $GitArguments `
+        -Wait `
+        -PassThru
+
+    Log "Git installer exit code: $($GitProcess.ExitCode)"
+
+    if ($GitProcess.ExitCode -ne 0) {
+        throw "Git installer failed with exit code $($GitProcess.ExitCode)"
+    }
+
+    Log "END: Install Git"
+
+    # =========================================================
+    # Install Azure CLI
+    # =========================================================
+
+    Log "BEGIN: Install Azure CLI $AzVersion"
+
+    $AzArguments = @(
+        "/i"
+        "`"$AzInstaller`""
+        "/qn"
+        "/norestart"
+    )
+
+    $AzProcess = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList $AzArguments `
+        -Wait `
+        -PassThru
+
+    Log "Azure CLI installer exit code: $($AzProcess.ExitCode)"
+
+    if ($AzProcess.ExitCode -notin @(0, 3010)) {
+        throw "Azure CLI MSI failed with exit code $($AzProcess.ExitCode)"
+    }
+
+    Log "END: Install Azure CLI"
+
+    # =========================================================
+    # Refresh PATH
+    # =========================================================
+
+    Log "BEGIN: Refresh PATH"
+
+    $MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $UserPath    = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path    = "$MachinePath;$UserPath"
+
+    Log "END: Refresh PATH"
+
+    # =========================================================
+    # Validate Git
+    # =========================================================
+
+    Log "BEGIN: Validate Git installation"
+
+    $GitExe = "C:\Program Files\Git\cmd\git.exe"
+
+    if (-not (Test-Path $GitExe)) {
+        throw "git.exe not found at expected path: $GitExe"
+    }
+
+    $GitVersionOutput = (& $GitExe --version).Trim()
+    Log "Git version output: $GitVersionOutput"
+
+    if ($GitVersionOutput -notmatch "2\.56\.0") {
+        throw "Unexpected Git version. Expected 2.56.0.x, Actual=$GitVersionOutput"
+    }
+
+    Log "END: Validate Git installation"
+
+    # =========================================================
+    # Locate Azure CLI
+    # =========================================================
+
+    Log "BEGIN: Locate Azure CLI"
+
+    $AzCandidates = @(
+        "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+    )
+
+    $AzExe = $AzCandidates |
+        Where-Object { Test-Path $_ } |
+        Select-Object -First 1
+
+    if (-not $AzExe) {
+        $AzCommand = Get-Command az.cmd -ErrorAction SilentlyContinue
+        if ($AzCommand) {
+            $AzExe = $AzCommand.Source
+        }
+    }
+
+    if (-not $AzExe) {
+        throw "Azure CLI az.cmd could not be located."
+    }
+
+    Log "Azure CLI path: $AzExe"
+    Log "END: Locate Azure CLI"
+
+    # =========================================================
+    # Validate Azure CLI
+    # =========================================================
+
+    Log "BEGIN: Validate Azure CLI installation"
+
+    $AzVersionOutput = (& $AzExe version --query '"azure-cli"' -o tsv).Trim()
+    Log "Azure CLI version: $AzVersionOutput"
+
+    if ($AzVersionOutput -ne $AzVersion) {
+        throw "Unexpected Azure CLI version. Expected=$AzVersion Actual=$AzVersionOutput"
+    }
+
+    Log "END: Validate Azure CLI installation"
+
+    # =========================================================
+    # Cleanup installers
+    # =========================================================
+
+    Remove-Item $GitInstaller -Force -ErrorAction SilentlyContinue
+    Remove-Item $AzInstaller -Force -ErrorAction SilentlyContinue
+
+    # =========================================================
+    # Success marker
+    # =========================================================
+
+    @"
+Milestone 2 completed successfully
+Git=$GitVersionOutput
+AzureCLI=$AzVersionOutput
+"@ | Set-Content -Path "C:\packer-m2-ok.txt" -Encoding ASCII
+
+    Log "SUCCESS MILESTONE 2"
+}
+catch {
+    Log ("ERROR: " + $_.Exception.Message)
+    throw
+}
