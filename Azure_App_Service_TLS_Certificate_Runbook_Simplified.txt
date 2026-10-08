@@ -1,0 +1,401 @@
+# Azure App Service TLS Certificate Runbook
+
+## Purpose
+
+This runbook explains how to install or renew a custom TLS/SSL certificate on Azure App Service, including certificate validation, PFX creation, DNS verification for `www`, App Service binding, HTTPS validation, and Infra-team coordination.
+
+## 1. Example
+
+```text
+Root domain:  examplesite.com
+WWW domain:   www.examplesite.com
+Certificate:  examplesite.com.crt
+Private key:  examplesite.com.key
+Output PFX:   examplesite.com.pfx
+```
+
+The certificate should cover both:
+
+```text
+DNS:examplesite.com
+DNS:www.examplesite.com
+```
+
+## 2. Prerequisites
+
+- Azure CLI
+- OpenSSL
+- Azure App Service access
+- Certificate file (`.crt/.cert`)
+- Matching private key (`.key`)
+- Intermediate/CA bundle if supplied
+- Infra/DNS team support
+
+On Windows with Git installed:
+
+```powershell
+$OpenSSL = "C:\Program Files\Git\usr\bin\openssl.exe"
+& $OpenSSL version
+```
+
+## 3. Check Certificate Details
+
+```powershell
+& $OpenSSL x509 `
+  -in .\examplesite.com.crt `
+  -noout `
+  -subject `
+  -issuer `
+  -dates `
+  -ext subjectAltName
+```
+
+Confirm SAN contains:
+
+```text
+DNS:examplesite.com
+DNS:www.examplesite.com
+```
+
+If both are present, a wildcard certificate is not required for these two hostnames.
+
+## 4. Validate the Private Key
+
+```powershell
+& $OpenSSL pkey `
+  -in .\examplesite.com.key `
+  -check `
+  -noout
+```
+
+Expected:
+
+```text
+Key is valid
+```
+
+## 5. Verify Certificate and Key Match
+
+```powershell
+& $OpenSSL x509 `
+  -in .\examplesite.com.crt `
+  -pubkey `
+  -noout `
+  -out cert-public.pem
+
+& $OpenSSL pkey `
+  -in .\examplesite.com.key `
+  -pubout `
+  -out key-public.pem
+
+Get-FileHash .\cert-public.pem -Algorithm SHA256
+Get-FileHash .\key-public.pem -Algorithm SHA256
+```
+
+Both hashes must match.
+
+## 6. Create the PFX
+
+Without CA bundle:
+
+```powershell
+& $OpenSSL pkcs12 `
+  -export `
+  -out .\examplesite.com.pfx `
+  -inkey .\examplesite.com.key `
+  -in .\examplesite.com.crt
+```
+
+With CA/intermediate bundle:
+
+```powershell
+& $OpenSSL pkcs12 `
+  -export `
+  -out .\examplesite.com.pfx `
+  -inkey .\examplesite.com.key `
+  -in .\examplesite.com.crt `
+  -certfile .\ca-bundle.crt
+```
+
+Use a strong PFX password.
+
+Validate:
+
+```powershell
+& $OpenSSL pkcs12 `
+  -in .\examplesite.com.pfx `
+  -info `
+  -noout
+```
+
+## 7. Set Azure Variables
+
+```powershell
+$RG  = "<resource-group>"
+$APP = "<app-service-name>"
+```
+
+Check login:
+
+```powershell
+az account show -o table
+```
+
+If required:
+
+```powershell
+az login
+```
+
+## 8. Check Existing Custom Domains
+
+```powershell
+az webapp config hostname list `
+  -g $RG `
+  --webapp-name $APP `
+  --query "[].{Hostname:name,SSLState:sslState,Thumbprint:thumbprint}" `
+  -o table
+```
+
+You should eventually have:
+
+```text
+examplesite.com
+www.examplesite.com
+```
+
+## 9. DNS TXT Record for `www`
+
+Get the App Service verification ID:
+
+```powershell
+az webapp show `
+  -g $RG `
+  -n $APP `
+  --query customDomainVerificationId `
+  -o tsv
+```
+
+Ask Infra to add this record in the authoritative DNS zone for `examplesite.com`:
+
+```text
+Type:  TXT
+Name:  asuid.www
+Value: <App Service verification ID>
+TTL:   300 or 600
+```
+
+It should resolve as:
+
+```text
+asuid.www.examplesite.com
+```
+
+Verify:
+
+```powershell
+Resolve-DnsName asuid.www.examplesite.com -Type TXT
+```
+
+## 10. Message to Infra Team
+
+```text
+Hi Team,
+
+Please add the following TXT record in the authoritative DNS zone for examplesite.com:
+
+Type: TXT
+Host/Name: asuid.www
+Value: <Azure App Service Custom Domain Verification ID>
+TTL: 300 or 600
+
+The resulting record should resolve as:
+asuid.www.examplesite.com
+
+The existing certificate already covers both examplesite.com and www.examplesite.com, so no wildcard certificate is required for the current setup.
+
+Please confirm once the TXT record is added and propagated.
+
+Thanks
+```
+
+## 11. Add `www` Custom Domain
+
+After the TXT record resolves:
+
+```powershell
+az webapp config hostname add `
+  --resource-group $RG `
+  --webapp-name $APP `
+  --hostname "www.examplesite.com"
+```
+
+Verify:
+
+```powershell
+az webapp config hostname list `
+  -g $RG `
+  --webapp-name $APP `
+  --query "[].{Hostname:name,SSLState:sslState,Thumbprint:thumbprint}" `
+  -o table
+```
+
+## 12. Upload the PFX
+
+In Azure Portal:
+
+```text
+App Service
+→ Certificates
+→ Bring your own certificates (.pfx)
+→ Add certificate
+```
+
+Upload `examplesite.com.pfx` and enter the PFX password.
+
+## 13. Get the Certificate Thumbprint
+
+```powershell
+az webapp config ssl list `
+  -g $RG `
+  --query "[].{Name:name,Thumbprint:thumbprint,Expiry:expirationDate,HostNames:hostNames}" `
+  -o table
+```
+
+Or get the certificate already bound to the root domain:
+
+```powershell
+az webapp config hostname list `
+  -g $RG `
+  --webapp-name $APP `
+  --query "[?name=='examplesite.com'].{Hostname:name,SSL:sslState,Thumbprint:thumbprint}" `
+  -o table
+```
+
+Set:
+
+```powershell
+$Thumbprint = "<certificate-thumbprint>"
+```
+
+## 14. Bind the Certificate to `www`
+
+```powershell
+az webapp config ssl bind `
+  -g $RG `
+  -n $APP `
+  --certificate-thumbprint $Thumbprint `
+  --ssl-type SNI `
+  --hostname "www.examplesite.com"
+```
+
+## 15. Verify Both Bindings
+
+```powershell
+az webapp config hostname list `
+  -g $RG `
+  --webapp-name $APP `
+  --query "[].{Hostname:name,SSLState:sslState,Thumbprint:thumbprint}" `
+  -o table
+```
+
+Expected:
+
+```text
+examplesite.com       SniEnabled
+www.examplesite.com   SniEnabled
+```
+
+## 16. Test Both URLs
+
+```powershell
+curl.exe -Iv https://examplesite.com
+curl.exe -Iv https://www.examplesite.com
+```
+
+Check that:
+
+- There is no TLS/certificate warning
+- There is no `404 Site Not Found`
+- Expected status is returned (`200`, `301`, or `302`)
+
+If `www` should redirect to the root domain:
+
+```text
+HTTP 301/302
+Location: https://examplesite.com/
+```
+
+## 17. Verify the Live Certificate
+
+```powershell
+& $OpenSSL s_client `
+  -connect www.examplesite.com:443 `
+  -servername www.examplesite.com `
+  2>$null |
+& $OpenSSL x509 `
+  -noout `
+  -subject `
+  -issuer `
+  -dates `
+  -ext subjectAltName
+```
+
+Confirm the live certificate includes:
+
+```text
+DNS:examplesite.com
+DNS:www.examplesite.com
+```
+
+## 18. Renewal Process
+
+```text
+Receive new certificate + key
+        ↓
+Validate certificate and SANs
+        ↓
+Validate certificate/key match
+        ↓
+Create new PFX
+        ↓
+Upload new PFX
+        ↓
+Update TLS bindings
+        ↓
+Test root + www
+        ↓
+Remove old certificate only after successful validation
+```
+
+Do not delete the old certificate before the new one is successfully bound and tested.
+
+## 19. Ownership
+
+| Task | Owner |
+|---|---|
+| Issue/renew certificate | Infra / PKI |
+| Provide `.crt/.cert`, `.key`, CA bundle | Infra / PKI |
+| Maintain authoritative DNS | Infra / DNS |
+| Add `asuid.www` TXT record | Infra / DNS |
+| Generate PFX | DevOps |
+| Upload PFX | DevOps |
+| Add custom hostname | DevOps |
+| Configure SNI binding | DevOps |
+| Validate HTTPS | DevOps |
+| Monitor expiry | DevOps |
+
+## 20. Final Checklist
+
+- [ ] Certificate SAN includes root + `www`
+- [ ] Private key is valid
+- [ ] Certificate and private key match
+- [ ] PFX created successfully
+- [ ] `asuid.www` TXT record added
+- [ ] `www` custom hostname added to App Service
+- [ ] PFX uploaded
+- [ ] TLS binding configured for root and `www`
+- [ ] HTTPS tested for both URLs
+- [ ] No TLS warning
+- [ ] No `404 Site Not Found`
+- [ ] Expiry monitoring enabled
