@@ -1,0 +1,246 @@
+# Analyze-AdoPipelineLogs.ps1
+# Read-only examination of Azure DevOps pipeline logs. PowerShell 5.1+.
+# Accepts: Downloaded log ZIP, extracted log folder, or one .txt/.log file.
+# ZIP entries are streamed without extracting them.
+# Reports contain categories, counts and source locations, never full log lines.
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [string]$OutputDirectory = (Join-Path $env:TEMP ("ADO-Log-Audit-" + (Get-Date -Format 'yyyyMMdd-HHmmss')))
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$Resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+$script:Findings = @{}
+$script:Scanned = 0
+$script:Lines = [long]0
+$script:Skipped = 0
+
+# Matches occur ONLY in execution-related lines or task titles, NOT generic
+# capability/environment dumps. A command reference is evidence, not proof
+# that the referenced executable was started successfully.
+$CommandTools = @(
+    @{Name='MSBuild'; Pattern='(?i)(?<![\w])msbuild(?:\.exe)?(?![\w])'},
+    @{Name='.NET CLI'; Pattern='(?i)(?<![\w])dotnet(?:\.exe)?(?![\w])'},
+    @{Name='NuGet'; Pattern='(?i)(?<![\w])nuget(?:\.exe)?(?![\w])'},
+    @{Name='npm'; Pattern='(?i)(?<![\w])npm(?:\.cmd|\.exe)?(?![\w])'},
+    @{Name='Node.js'; Pattern='(?i)(?<![\w])node(?:\.exe)?(?![\w])'},
+    @{Name='VSTest'; Pattern='(?i)(?<![\w])vstest(?:\.console)?(?:\.exe)?(?![\w])'},
+    @{Name='SqlPackage'; Pattern='(?i)(?<![\w])sqlpackage(?:\.exe)?(?![\w])'},
+    @{Name='SQL LocalDB'; Pattern='(?i)(?<![\w])sqllocaldb(?:\.exe)?(?![\w])'},
+    @{Name='Web Deploy (MSDeploy)'; Pattern='(?i)(?<![\w])msdeploy(?:\.exe)?(?![\w])'},
+    @{Name='Git'; Pattern='(?i)(?<![\w])git(?:\.exe)?(?![\w])'},
+    @{Name='PowerShell'; Pattern='(?i)(?<![\w])powershell(?:\.exe)?(?![\w])'},
+    @{Name='SignTool'; Pattern='(?i)(?<![\w])signtool(?:\.exe)?(?![\w])'},
+    @{Name='C++ compiler'; Pattern='(?i)(?<![\w])cl\.exe(?![\w])'},
+    @{Name='Java'; Pattern='(?i)(?<![\w])java(?:\.exe)?(?![\w])'},
+    @{Name='Maven'; Pattern='(?i)(?<![\w])mvn(?:\.cmd|\.exe)?(?![\w])'},
+    @{Name='Gradle'; Pattern='(?i)(?<![\w])gradle(?:\.bat|\.cmd)?(?![\w])'}
+)
+
+$TaskHints = @(
+    @{Name='Visual Studio / MSBuild'; Pattern='(?i)\b(?:Visual Studio build|VSBuild|MSBuild)\b'},
+    @{Name='.NET build/test/publish'; Pattern='(?i)\b(?:\.NET Core|DotNetCoreCLI|dotnet|NuGet restore)\b'},
+    @{Name='Node.js / npm'; Pattern='(?i)\b(?:npm|NodeTool|Node\.js)\b'},
+    @{Name='Visual Studio Test'; Pattern='(?i)\b(?:VSTest|Visual Studio Test)\b'},
+    @{Name='IIS deployment'; Pattern='(?i)\b(?:Deploy to IIS|IIS Web App|Web Deploy)\b'},
+    @{Name='Artifact download'; Pattern='(?i)\b(?:Download|DownloadBuildArtifacts|DownloadPipelineArtifact)\b'},
+    @{Name='MAUI / mobile development'; Pattern='(?i)\b(?:MAUI|Android|iOS|MacCatalyst|Xamarin)\b'},
+    @{Name='SQL package / LocalDB'; Pattern='(?i)\b(?:SqlPackage|LocalDB|SqlAzureDacpacDeployment)\b'},
+    @{Name='C++ / Windows SDK'; Pattern='(?i)\b(?:C\+\+|Windows SDK|VSBuild)\b'}
+)
+
+function Add-Finding {
+    param([string]$Category, [string]$Finding, [string]$Evidence,
+          [string]$Source, [long]$LineNumber)
+
+    $key = $Category + [char]31 + $Finding + [char]31 + $Evidence
+    if (-not $script:Findings.ContainsKey($key)) {
+        $script:Findings[$key] = [pscustomobject]@{
+            Category = $Category
+            Finding = $Finding
+            Evidence = $Evidence
+            Count = 0
+            Files = @{}
+            FirstLocation = ('{0}:{1}' -f $Source, $LineNumber)
+        }
+    }
+    $item = $script:Findings[$key]
+    $item.Count++
+    $item.Files[$Source] = $true
+}
+
+function Read-LogStream {
+    param([System.IO.TextReader]$Reader, [string]$SourceName)
+
+    $script:Scanned++
+    $lineNumber = [long]0
+    while ($null -ne ($line = $Reader.ReadLine())) {
+        $lineNumber++
+        $script:Lines++
+
+        # Avoid searching exceptionally long/debug-generated lines.
+        if ($line.Length -gt 8192) { $line = $line.Substring(0, 8192) }
+
+        # A step actually entered its Starting phase. Task labels are
+        # preserved, but commands, arguments and raw lines are never saved.
+        if ($line -match '(?i)##\[section\]Starting:\s*(.+?)\s*$') {
+            $step = $Matches[1].Trim()
+            if ($step.Length -gt 100) { $step = $step.Substring(0, 100) + '...' }
+            Add-Finding 'Pipeline steps' $step 'Step started' $SourceName $lineNumber
+            foreach ($hint in $TaskHints) {
+                if ([regex]::IsMatch($step, $hint.Pattern)) {
+                    Add-Finding 'Task/tool hints' $hint.Name 'Step name' $SourceName $lineNumber
+                }
+            }
+        }
+
+        if ($line -match '(?i)^\s*Task\s*:\s*(.+?)\s*$') {
+            $taskTitle = $Matches[1].Trim()
+            foreach ($hint in $TaskHints) {
+                if ([regex]::IsMatch($taskTitle, $hint.Pattern)) {
+                    Add-Finding 'Task/tool hints' $hint.Name 'Task description' $SourceName $lineNumber
+                }
+            }
+        }
+
+        # Only attempt command detection on lines marked as invocation,
+        # not on environment dumps containing paths to all installed tools.
+        $isInvocation = $line -match '(?i)(?:##\[command\]|File name:\s*|\b(?:Command line|Executing command|Running command)\s*:)'
+        if ($isInvocation) {
+            foreach ($tool in $CommandTools) {
+                if (-not [regex]::IsMatch($line, $tool.Pattern)) { continue }
+
+                $toolName = $tool.Name
+                if ($toolName -eq 'Node.js' -and
+                    $line -match '(?i)[\\/]externals[\\/]node\d*[\\/]') {
+                    $toolName = 'Node.js (bundled with Azure agent)'
+                }
+                Add-Finding 'Command references' $toolName 'Invocation line' $SourceName $lineNumber
+            }
+        }
+
+        # A target framework mentioned by a build/task log is a useful
+        # configuration clue, NOT independent proof of runtime usage.
+        if ($line -match '(?i)TargetFrameworkVersion\s*[=:]\s*["'']?(v\d+(?:\.\d+){1,3})') {
+            Add-Finding 'Target framework hints' $Matches[1].ToLowerInvariant() 'Configuration reference' $SourceName $lineNumber
+        }
+        if ($line -match '(?i)(?:TargetFrameworks?\s*[=:]\s*["'']?|--framework\s+)(net(?:standard|coreapp)?\d+(?:\.\d+){0,2}(?:-[\w.]+)?)') {
+            Add-Finding 'Target framework hints' $Matches[1].ToLowerInvariant() 'Configuration reference' $SourceName $lineNumber
+        }
+    }
+}
+
+function Read-PhysicalFile {
+    param([string]$FilePath, [string]$DisplayName)
+    $reader = $null
+    try {
+        $reader = [System.IO.StreamReader]::new($FilePath)
+        Read-LogStream -Reader $reader -SourceName $DisplayName
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+    }
+}
+
+Write-Host ('Analyzing: {0}' -f $Resolved) -ForegroundColor Cyan
+
+if (Test-Path -LiteralPath $Resolved -PathType Container) {
+    $files = @(Get-ChildItem -LiteralPath $Resolved -Recurse -File -ErrorAction Stop |
+        Where-Object { $_.Extension -in @('.txt', '.log') })
+    foreach ($file in $files) {
+        Read-PhysicalFile -FilePath $file.FullName -DisplayName $file.FullName.Substring($Resolved.Length).TrimStart('\', '/')
+    }
+}
+elseif ([System.IO.Path]::GetExtension($Resolved) -ieq '.zip') {
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    $fileStream = $null
+    $archive = $null
+    try {
+        $fileStream = [System.IO.File]::OpenRead($Resolved)
+        $archive = [System.IO.Compression.ZipArchive]::new($fileStream, [System.IO.Compression.ZipArchiveMode]::Read, $false)
+        foreach ($entry in $archive.Entries) {
+            if ([System.IO.Path]::GetExtension($entry.Name) -notin @('.txt', '.log')) { continue }
+            if ($entry.Length -gt 500MB) {
+                Write-Warning ('Skipping oversized ZIP entry: {0}' -f $entry.FullName)
+                $script:Skipped++
+                continue
+            }
+            $reader = $null
+            try {
+                $reader = [System.IO.StreamReader]::new($entry.Open())
+                Read-LogStream -Reader $reader -SourceName $entry.FullName
+            }
+            finally {
+                if ($null -ne $reader) { $reader.Dispose() }
+            }
+        }
+    }
+    finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $fileStream) { $fileStream.Dispose() }
+    }
+}
+elseif ([System.IO.Path]::GetExtension($Resolved) -in @('.txt', '.log')) {
+    Read-PhysicalFile -FilePath $Resolved -DisplayName ([System.IO.Path]::GetFileName($Resolved))
+}
+else {
+    throw 'Supported inputs: .zip, .txt, .log or a folder containing .txt/.log files.'
+}
+
+if ($script:Scanned -eq 0) {
+    Write-Warning 'No .txt/.log files found in the selected path.'
+    return
+}
+
+$rows = @(
+    foreach ($item in $script:Findings.Values) {
+        [pscustomobject]@{
+            Category = $item.Category
+            Finding = $item.Finding
+            Evidence = $item.Evidence
+            Occurrences = $item.Count
+            LogFiles = $item.Files.Count
+            FirstLocation = $item.FirstLocation
+        }
+    }
+)
+$rows = @($rows | Sort-Object Category, Finding, Evidence)
+
+New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+$ReportFile = Join-Path $OutputDirectory 'ADO-Evidence-Summary.csv'
+$rows | Export-Csv -LiteralPath $ReportFile -NoTypeInformation -Encoding UTF8
+
+Write-Host ("`nScanned {0} text logs ({1:N0} lines). Skipped {2} oversized entries." -f $script:Scanned, $script:Lines, $script:Skipped) -ForegroundColor Green
+Write-Host "`n===== COMMAND REFERENCES (not capability inventory) =====" -ForegroundColor Cyan
+$rows | Where-Object { $_.Category -eq 'Command references' } |
+    Sort-Object Occurrences -Descending |
+    Select-Object Finding, Occurrences, LogFiles |
+    Format-Table -AutoSize
+
+Write-Host "`n===== BUILD / DEPLOY TASK HINTS =====" -ForegroundColor Cyan
+$rows | Where-Object { $_.Category -eq 'Task/tool hints' } |
+    Sort-Object Occurrences -Descending |
+    Select-Object Finding, Evidence, Occurrences, LogFiles |
+    Format-Table -AutoSize
+
+Write-Host "`n===== TARGET FRAMEWORK HINTS =====" -ForegroundColor Cyan
+$rows | Where-Object { $_.Category -eq 'Target framework hints' } |
+    Sort-Object Occurrences -Descending |
+    Select-Object Finding, Occurrences, LogFiles |
+    Format-Table -AutoSize
+
+Write-Host "`n===== PIPELINE STEPS (up to 30 distinct) =====" -ForegroundColor Cyan
+$rows | Where-Object { $_.Category -eq 'Pipeline steps' } |
+    Sort-Object Occurrences -Descending |
+    Select-Object -First 30 Finding, Occurrences, LogFiles |
+    Format-Table -AutoSize -Wrap
+
+Write-Host "`nFull compact CSV report: $ReportFile" -ForegroundColor Green
+Write-Host 'Note: Reports omit raw log lines, but filenames and step names may contain internal project details; review before sharing.'
+Write-Host 'Do not uninstall components solely because they are absent from these logs.'
